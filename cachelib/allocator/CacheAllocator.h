@@ -1379,6 +1379,44 @@ class CacheAllocator : public CacheBase {
   // run the benchmarks after flushing.
   void flushNvmCache();
 
+  // Online resize of the NVM block cache (the large item engine of Navy).
+  //
+  // Sets the block cache space in service to @newSize bytes, rounded down to
+  // whole regions and clamped to the engine's [min, max]. Shrinking evicts
+  // every item in the released regions and gives their device space back:
+  // holes are punched in the cache file(s), block devices get a discard
+  // (TRIM). This is asynchronous: the call returns the new target right
+  // away and the work runs on Navy's threads; poll isNvmBlockCacheResizing()
+  // to know when the space has been released. Growing back up to the
+  // configured size takes effect immediately. Safe to call under load.
+  //
+  // BigHash (small item engine) is not resizable. Only supported with a
+  // single Navy engine pair.
+  //
+  // @return the new block cache size in service in bytes; 0 if NVM cache is
+  //         not enabled
+  uint64_t resizeNvmBlockCache(uint64_t newSize) {
+    return nvmCache_ ? nvmCache_->resizeBlockCache(newSize) : 0;
+  }
+
+  // Block cache size in service (the current resize target); 0 if NVM cache
+  // is not enabled.
+  uint64_t getNvmBlockCacheSize() const {
+    return nvmCache_ ? nvmCache_->getBlockCacheSize() : 0;
+  }
+
+  // Block cache size configured at startup; upper bound for
+  // resizeNvmBlockCache(). 0 if NVM cache is not enabled.
+  uint64_t getNvmBlockCacheMaxSize() const {
+    return nvmCache_ ? nvmCache_->getBlockCacheMaxSize() : 0;
+  }
+
+  // True while a shrink started by resizeNvmBlockCache() is still evicting
+  // and releasing regions.
+  bool isNvmBlockCacheResizing() const {
+    return nvmCache_ ? nvmCache_->isBlockCacheResizing() : false;
+  }
+
   // Dump the last N items for an MM Container
   // @return  vector of the string of each item. Empty if nothing in LRU
   // @throw  std::invalid_argument if <pid, cid> does not exist

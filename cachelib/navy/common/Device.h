@@ -169,6 +169,17 @@ class Device {
   // Everything should be on device after this call returns.
   void flush() { flushImpl(); }
 
+  // Releases the physical storage backing [offset, offset + size) while
+  // keeping the device size unchanged. Data in the range is lost. Regular
+  // files get a hole punched (blocks returned to the file system); block
+  // devices get a discard (TRIM). Devices that don't support it return false
+  // and leave the range untouched. @offset and @size must be ioAlignmentSize_
+  // aligned.
+  bool discard(uint64_t offset, uint64_t size);
+
+  // Return bytes discarded since device start
+  uint64_t getBytesDiscarded() const { return bytesDiscarded_.get(); }
+
   // Return bytes written since device start
   uint64_t getBytesWritten() const { return bytesWritten_.get(); }
 
@@ -191,6 +202,10 @@ class Device {
                          int placeHandle = -1) = 0;
   virtual bool readImpl(uint64_t offset, uint32_t size, void* value) = 0;
   virtual void flushImpl() = 0;
+  // Default: not supported.
+  virtual bool discardImpl(uint64_t /* offset */, uint64_t /* size */) {
+    return false;
+  }
 
   // This measures the latency of an individual read or write iop between its
   // submission and completion. Slowdowns in the kernel and the boundary between
@@ -203,6 +218,8 @@ class Device {
  private:
   mutable AtomicCounter bytesWritten_;
   mutable AtomicCounter bytesRead_;
+  mutable AtomicCounter bytesDiscarded_;
+  mutable AtomicCounter discardErrors_;
   mutable AtomicCounter writeIOErrors_;
   mutable AtomicCounter readIOErrors_;
   mutable AtomicCounter encryptionErrors_;

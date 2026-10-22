@@ -111,6 +111,16 @@ class EnginePair {
 
   uint64_t getUsableSize() const;
 
+  // Online resize of the large item cache (BlockCache). See Engine::resize.
+  uint64_t resizeLargeItemCache(uint64_t newSize);
+  uint64_t getLargeItemCacheSize() const { return largeItemCache_->getSize(); }
+  uint64_t getLargeItemCacheMaxSize() const {
+    return largeItemCache_->getMaxSize();
+  }
+  bool isLargeItemCacheResizing() const {
+    return largeItemCache_->isResizing();
+  }
+
   std::pair<Status, std::string /* key */> getRandomAlloc(Buffer& value);
 
   void validate();

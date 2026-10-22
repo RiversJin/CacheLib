@@ -17,6 +17,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "cachelib/navy/block_cache/FifoPolicy.h"
 #include "cachelib/navy/block_cache/tests/TestHelpers.h"
 
@@ -139,5 +141,87 @@ TEST(EvictionPolicy, SegmentedFifoRebalance) {
   EXPECT_EQ(region3.id(), policy.evict());
   EXPECT_EQ(region1.id(), policy.evict());
   EXPECT_EQ(region2.id(), policy.evict());
+}
+
+TEST(EvictionPolicy, FifoRemove) {
+  FifoPolicy policy;
+  policy.track(kRegion0);
+  policy.track(kRegion1);
+  policy.track(kRegion2);
+  policy.track(kRegion3);
+  // Pull one out of the middle and one that isn't tracked
+  EXPECT_TRUE(policy.remove(kRegion1.id()));
+  EXPECT_FALSE(policy.remove(kRegion1.id()));
+  EXPECT_FALSE(policy.remove(RegionId{7}));
+  EXPECT_EQ(kRegion0.id(), policy.evict());
+  EXPECT_EQ(kRegion2.id(), policy.evict());
+  EXPECT_EQ(kRegion3.id(), policy.evict());
+  EXPECT_EQ(RegionId{}, policy.evict());
+}
+
+TEST(EvictionPolicy, FifoRemoveIf) {
+  FifoPolicy policy;
+  policy.track(kRegion0);
+  policy.track(kRegion1);
+  policy.track(kRegion2);
+  policy.track(kRegion3);
+  // Shrink-style: everything at or above a threshold goes, in queue order
+  auto removed = policy.removeIf([](RegionId rid) { return rid.index() >= 2; });
+  ASSERT_EQ(2u, removed.size());
+  EXPECT_EQ(kRegion2.id(), removed[0]);
+  EXPECT_EQ(kRegion3.id(), removed[1]);
+  // Nothing matches: queue untouched
+  EXPECT_TRUE(policy.removeIf([](RegionId) { return false; }).empty());
+  EXPECT_EQ(kRegion0.id(), policy.evict());
+  EXPECT_EQ(kRegion1.id(), policy.evict());
+  EXPECT_EQ(RegionId{}, policy.evict());
+}
+
+TEST(EvictionPolicy, SegmentedFifoRemoveIf) {
+  Region region0{RegionId{0}, 100};
+  Region region1{RegionId{1}, 100};
+  Region region2{RegionId{2}, 100};
+  Region region3{RegionId{3}, 100};
+  region0.setPriority(0);
+  region1.setPriority(1);
+  region2.setPriority(1);
+  region3.setPriority(0);
+
+  SegmentedFifoPolicy policy{{1, 1}};
+  policy.track(region0);
+  policy.track(region1);
+  policy.track(region2);
+  policy.track(region3);
+  auto removed = policy.removeIf([](RegionId rid) { return rid.index() >= 2; });
+  ASSERT_EQ(2u, removed.size());
+  EXPECT_EQ(1, std::count(removed.begin(), removed.end(), region2.id()));
+  EXPECT_EQ(1, std::count(removed.begin(), removed.end(), region3.id()));
+  EXPECT_EQ(region0.id(), policy.evict());
+  EXPECT_EQ(region1.id(), policy.evict());
+  EXPECT_EQ(RegionId{}, policy.evict());
+}
+
+TEST(EvictionPolicy, SegmentedFifoRemove) {
+  Region region0{RegionId{0}, 100};
+  Region region1{RegionId{1}, 100};
+  Region region2{RegionId{2}, 100};
+  Region region3{RegionId{3}, 100};
+  region0.setPriority(0);
+  region1.setPriority(1);
+  region2.setPriority(1);
+  region3.setPriority(0);
+
+  SegmentedFifoPolicy policy{{1, 1}};
+  policy.track(region0);
+  policy.track(region1);
+  policy.track(region2);
+  policy.track(region3);
+  EXPECT_TRUE(policy.remove(region1.id()));
+  EXPECT_FALSE(policy.remove(region1.id()));
+  EXPECT_TRUE(policy.remove(region0.id()));
+  // Only 3 and 2 are left, in that eviction order (lowest priority first)
+  EXPECT_EQ(region3.id(), policy.evict());
+  EXPECT_EQ(region2.id(), policy.evict());
+  EXPECT_EQ(RegionId{}, policy.evict());
 }
 } // namespace facebook::cachelib::navy::tests

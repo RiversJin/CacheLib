@@ -49,6 +49,9 @@ struct RegionData {
   // Serialized eviction policy state (e.g., FIFO queue order).
   // Used to preserve eviction ordering across restarts.
   3: optional EvictionPolicyData evictionPolicyData;
+  // Number of regions in service after an online shrink; regions with a
+  // higher id are retired. Absent means all regions are in service.
+  4: optional i32 numActiveRegions;
 }
 
 struct FifoPolicyNodeData {

@@ -2967,4 +2967,137 @@ TEST(BlockCache, LookupIndexEntryReturnsNotFoundAfterRemove) {
   EXPECT_EQ(Status::NotFound, result.error());
 }
 
+namespace {
+// Inserts @numRegions regions' worth of entries (16 per region) and flushes
+// after each region so the allocator lets go of it.
+void fillRegions(Driver& driver,
+                 BufferGen& bg,
+                 std::vector<CacheEntry>& log,
+                 size_t numRegions) {
+  for (size_t j = 0; j < numRegions; j++) {
+    for (size_t i = 0; i < 16; i++) {
+      CacheEntry e{bg.gen(8), bg.gen(800)};
+      EXPECT_EQ(Status::Ok,
+                driver.insertAsync(e.key(), e.value(), nullptr, 0 /* poolId */,
+                                   0 /* expiryTime */));
+      log.push_back(std::move(e));
+    }
+    driver.flush();
+  }
+}
+
+void expectLookups(Driver& driver,
+                   const std::vector<CacheEntry>& log,
+                   size_t from,
+                   size_t to,
+                   Status expected) {
+  for (size_t i = from; i < to; i++) {
+    Buffer value;
+    uint32_t lat = 0;
+    EXPECT_EQ(expected, driver.lookup(log[i].key(), value, lat)) << i;
+    if (expected == Status::Ok) {
+      EXPECT_EQ(log[i].value(), value.view()) << i;
+    }
+  }
+}
+} // namespace
+
+TEST(BlockCache, Resize) {
+  // 8 regions of 16k
+  constexpr uint64_t kCacheSize = 8 * kRegionSize;
+  std::vector<uint32_t> hits(8);
+  auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
+  auto device = createMemoryDevice(kCacheSize, nullptr /* encryption */);
+  auto* devicePtr = device.get();
+  auto ex = makeJobScheduler();
+  auto config = makeConfig(std::move(policy), *device, kCacheSize);
+  auto engine = makeEngine(std::move(config));
+  auto driver = makeDriver(std::move(engine), std::move(ex));
+
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheSize());
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheMaxSize());
+  EXPECT_FALSE(driver->isBlockCacheResizing());
+
+  BufferGen bg;
+  std::vector<CacheEntry> log;
+  fillRegions(*driver, bg, log, 6);
+  expectLookups(*driver, log, 0, 96, Status::Ok);
+
+  // Shrink to 3 regions. Minimum is cleanRegionsPool(1) + allocators(1) + 1,
+  // so 3 is accepted as is. Regions 3..7 get retired; 3, 4 and 5 hold data.
+  EXPECT_EQ(3 * kRegionSize, driver->resizeBlockCache(3 * kRegionSize));
+  EXPECT_EQ(3 * kRegionSize, driver->getBlockCacheSize());
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheMaxSize());
+  driver->flush(); // waits for the retirements
+  EXPECT_FALSE(driver->isBlockCacheResizing());
+  EXPECT_EQ(5 * kRegionSize, devicePtr->getBytesDiscarded());
+  expectLookups(*driver, log, 0, 48, Status::Ok);
+  expectLookups(*driver, log, 48, 96, Status::NotFound);
+
+  // Inserting again has to reclaim since only 3 regions are left: the clean
+  // pool is empty, so region 0 is reclaimed for the writer and region 1 to
+  // refill the pool (cleanRegionsPool = 1).
+  fillRegions(*driver, bg, log, 1);
+  expectLookups(*driver, log, 0, 32, Status::NotFound);
+  expectLookups(*driver, log, 32, 48, Status::Ok);
+  expectLookups(*driver, log, 96, 112, Status::Ok);
+
+  // Below the minimum is clamped
+  EXPECT_EQ(3 * kRegionSize, driver->resizeBlockCache(kRegionSize));
+  EXPECT_EQ(3 * kRegionSize, driver->resizeBlockCache(0));
+  // Above the maximum is clamped, and growing takes effect immediately
+  EXPECT_EQ(kCacheSize, driver->resizeBlockCache(100 * kCacheSize));
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheSize());
+  EXPECT_FALSE(driver->isBlockCacheResizing());
+
+  // Now there are clean regions again: nothing gets evicted
+  fillRegions(*driver, bg, log, 2);
+  expectLookups(*driver, log, 32, 48, Status::Ok);
+  expectLookups(*driver, log, 96, 144, Status::Ok);
+}
+
+TEST(BlockCache, ResizeRecovery) {
+  constexpr uint64_t kCacheSize = 8 * kRegionSize;
+  std::vector<uint32_t> hits(8);
+  uint32_t ioAlignSize = 4096;
+  auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
+  size_t metadataSize = 3 * 1024 * 1024;
+  auto deviceSize = metadataSize + kCacheSize;
+  auto device =
+      createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
+  auto ex = makeJobScheduler();
+  auto config = makeConfig(std::move(policy), *device, kCacheSize);
+  config.numInMemBuffers = 2;
+  auto engine = makeEngine(std::move(config), metadataSize);
+  auto driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
+                           metadataSize);
+
+  BufferGen bg;
+  std::vector<CacheEntry> log;
+  fillRegions(*driver, bg, log, 6);
+  // Minimum is cleanRegionsPool(1) + numInMemBuffers(2) + 1 = 4 regions, so
+  // asking for 3 is rounded up.
+  EXPECT_EQ(4 * kRegionSize, driver->resizeBlockCache(3 * kRegionSize));
+  driver->flush();
+  EXPECT_FALSE(driver->isBlockCacheResizing());
+  driver->persist();
+
+  EXPECT_TRUE(driver->recover());
+  EXPECT_EQ(4 * kRegionSize, driver->getBlockCacheSize());
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheMaxSize());
+  expectLookups(*driver, log, 0, 64, Status::Ok);
+  expectLookups(*driver, log, 64, 96, Status::NotFound);
+
+  // Still only 4 regions: the next region evicts region 0 (and region 1 to
+  // refill the clean pool)
+  fillRegions(*driver, bg, log, 1);
+  expectLookups(*driver, log, 0, 32, Status::NotFound);
+  expectLookups(*driver, log, 32, 64, Status::Ok);
+  expectLookups(*driver, log, 96, 112, Status::Ok);
+
+  // reset() goes back to the configured size
+  driver->reset();
+  EXPECT_EQ(kCacheSize, driver->getBlockCacheSize());
+}
+
 } // namespace facebook::cachelib::navy::tests

@@ -87,6 +87,36 @@ RegionId LruPolicy::evict() {
   return RegionId{retRegion};
 }
 
+bool LruPolicy::remove(RegionId rid) {
+  XDCHECK(rid.valid());
+  auto i = rid.index();
+  std::lock_guard lock{mutex_};
+  // inList() looks at the links only, which are both invalid for the sole
+  // node of a one-element list; that node is the head.
+  if (i >= array_.size() || (!array_[i].inList() && head_ != i)) {
+    return false;
+  }
+  unlink(i);
+  return true;
+}
+
+std::vector<RegionId> LruPolicy::removeIf(
+    const std::function<bool(RegionId)>& pred) {
+  std::vector<RegionId> removed;
+  std::lock_guard lock{mutex_};
+  uint32_t i = head_;
+  while (i != kInvalidIndex) {
+    // unlink() clears the node's links, so read the successor first
+    const uint32_t next = array_[i].next;
+    if (pred(RegionId{i})) {
+      unlink(i);
+      removed.emplace_back(i);
+    }
+    i = next;
+  }
+  return removed;
+}
+
 void LruPolicy::reset() {
   std::lock_guard lock{mutex_};
   array_.clear();

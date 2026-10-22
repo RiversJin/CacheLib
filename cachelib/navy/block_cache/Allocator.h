@@ -18,6 +18,7 @@
 
 #include <folly/fibers/TimedMutex.h>
 
+#include <functional>
 #include <vector>
 
 #include "cachelib/common/AtomicCounter.h"
@@ -111,6 +112,12 @@ class Allocator {
 
   // Flushes any regions with in-memory buffers to device.
   void flush();
+
+  // Flushes (asynchronously) and lets go of every region currently used for
+  // allocation for which @pred returns true. Used by BlockCache::resize() to
+  // get regions marked for retirement out of the allocators' hands.
+  // Returns the number of regions released.
+  uint32_t releaseRegionsIf(const std::function<bool(RegionId)>& pred);
 
   // Exports Allocator stats via CounterVisitor.
   void getCounters(const CounterVisitor& visitor) const;

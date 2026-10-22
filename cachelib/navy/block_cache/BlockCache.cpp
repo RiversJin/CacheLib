@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <type_traits>
 #include <utility>
 
@@ -231,6 +232,18 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
                           ? kDefReadBufferSize
                           : config.readBufferSize},
       regionSize_{config.regionSize},
+      // See getMinSize(). Regions outside the eviction policy are bounded
+      // by the clean pool (pool + outstanding reclaims) plus the regions
+      // that hold an in-memory buffer (being written to or flushed), which
+      // can't exceed the buffer count; keep one more so a reclaim always
+      // finds a victim.
+      minActiveRegions_{static_cast<uint32_t>(
+          config.cleanRegionsPool +
+          std::max<uint32_t>(
+              config.numInMemBuffers,
+              std::accumulate(config.allocatorsPerPriority.begin(),
+                              config.allocatorsPerPriority.end(), 0u)) +
+          1)},
       itemDestructorEnabled_{config.itemDestructorEnabled},
       preciseRemove_{config.preciseRemove},
       combinedEntryMgr_(createCombinedEntryManager(config)),
@@ -1457,6 +1470,27 @@ void BlockCache::readEntry(RegionDescriptor& regionDesc,
 
 void BlockCache::drain() { regionManager_.drain(); }
 
+uint64_t BlockCache::getMinSize() const {
+  return std::min<uint64_t>(minActiveRegions_, regionManager_.numRegions()) *
+         regionSize_;
+}
+
+uint64_t BlockCache::resize(uint64_t newSize) {
+  const uint32_t numRegions = regionManager_.numRegions();
+  const uint32_t minRegions = std::min(minActiveRegions_, numRegions);
+  uint64_t target = newSize / regionSize_;
+  target = std::clamp<uint64_t>(target, minRegions, numRegions);
+  XLOGF(INFO, "Resize block cache to {} bytes: {} -> {} regions", newSize,
+        regionManager_.numActiveRegions(), target);
+  const auto numActive = regionManager_.resize(static_cast<uint32_t>(target));
+  // Regions marked for retirement that an allocator is still writing into
+  // only get retired once they are flushed; make that happen now instead of
+  // waiting for them to fill up.
+  allocator_.releaseRegionsIf(
+      [this](RegionId rid) { return regionManager_.isRetiringOrRetired(rid); });
+  return static_cast<uint64_t>(numActive) * regionSize_;
+}
+
 void BlockCache::flush() {
   XLOG(INFO, "Flush block cache");
   allocator_.flush();
@@ -1489,6 +1523,8 @@ void BlockCache::initializeBlockCache() {
 
 uint64_t BlockCache::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_size", getSize());
+  visitor("navy_bc_max_size", getMaxSize());
+  visitor("navy_bc_min_size", getMinSize());
   // computeSize() walks every bucket map, so call it once and reuse.
   const auto numIndexEntries = index_->computeSize();
   const auto persistSize = estimatePersistSize(numIndexEntries);

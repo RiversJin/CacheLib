@@ -335,6 +335,41 @@ uint64_t Driver::getUsableSize() const {
   return size;
 }
 
+uint64_t Driver::resizeBlockCache(uint64_t newSize) {
+  if (enginePairs_.size() != 1) {
+    throw std::invalid_argument(fmt::format(
+        "Block cache resize is only supported with a single engine pair "
+        "(configured: {})",
+        enginePairs_.size()));
+  }
+  return enginePairs_[0].resizeLargeItemCache(newSize);
+}
+
+uint64_t Driver::getBlockCacheSize() const {
+  uint64_t size = 0;
+  for (const auto& p : enginePairs_) {
+    size += p.getLargeItemCacheSize();
+  }
+  return size;
+}
+
+uint64_t Driver::getBlockCacheMaxSize() const {
+  uint64_t size = 0;
+  for (const auto& p : enginePairs_) {
+    size += p.getLargeItemCacheMaxSize();
+  }
+  return size;
+}
+
+bool Driver::isBlockCacheResizing() const {
+  for (const auto& p : enginePairs_) {
+    if (p.isLargeItemCacheResizing()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Driver::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_rejected", rejectedCount_.get(),
           CounterVisitor::CounterType::RATE);

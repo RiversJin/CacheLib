@@ -146,8 +146,35 @@ class BlockCache final : public Engine {
   BlockCache& operator=(const BlockCache&) = delete;
   ~BlockCache() override;
 
-  // return the size of usable space
+  // Size of the space in service. After a shrink this is the target size,
+  // even while the retirement of the surplus regions is still in progress
+  // (see isResizing()).
   uint64_t getSize() const override { return regionManager_.getSize(); }
+
+  // Size configured at construction; the upper bound for resize().
+  uint64_t getMaxSize() const override { return regionManager_.getMaxSize(); }
+
+  // Changes the space in service to @newSize bytes, rounded down to a whole
+  // number of regions and clamped to [getMinSize(), getMaxSize()]. Items in
+  // the regions taken out of service are evicted and their device space is
+  // released (Device::discard). Shrinking is asynchronous: this returns the
+  // new target size right away and the evictions happen on the region
+  // manager's worker threads; poll isResizing() to know when they are done.
+  // Growing takes effect immediately. Safe to call under load.
+  //
+  // @return the new size in service (target), in bytes
+  uint64_t resize(uint64_t newSize) override;
+
+  // Smallest size resize() accepts: cleanRegionsPool + numInMemBuffers (the
+  // most regions that can be held by allocators or be in flight to the
+  // device at once) + 1, so that a reclaim always finds a region in the
+  // eviction policy.
+  uint64_t getMinSize() const;
+
+  // True while a shrink started by resize() still has regions to retire.
+  bool isResizing() const override {
+    return regionManager_.numRetiringRegions() > 0;
+  }
 
   // Checks if the key could exist in block cache. This can be used as a
   // pre-check to optimize cache lookups to avoid calling lookup in an async IO
@@ -547,6 +574,8 @@ class BlockCache final : public Engine {
   const uint32_t readBufferSize_{};
   // number of bytes in a region
   const uint64_t regionSize_{};
+  // lower bound (in regions) for resize(); see getMinSize()
+  const uint32_t minActiveRegions_{};
   // whether ItemDestructor is enabled
   const bool itemDestructorEnabled_{false};
   // whether preciseRemove is enabled

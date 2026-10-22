@@ -139,6 +139,29 @@ class AbstractCache {
   // Return the size of space used for caching
   virtual uint64_t getUsableSize() const = 0;
 
+  // ---- Online resize of the block cache (large item engine) ----
+  //
+  // Changes the block cache space in service to @newSize bytes (rounded down
+  // to whole regions and clamped to the engine's [min, max]) and releases
+  // the device storage of the space taken out of service. Shrinking is
+  // asynchronous: the call returns the new target size immediately and the
+  // evictions run on Navy's worker threads; poll isBlockCacheResizing() to
+  // know when the space has actually been released. Growing takes effect
+  // immediately. Only supported with a single engine pair.
+  //
+  // @return the new block cache size in service, in bytes
+  // @throw std::invalid_argument if more than one engine pair is configured
+  virtual uint64_t resizeBlockCache(uint64_t newSize) = 0;
+
+  // Block cache size in service (the current target).
+  virtual uint64_t getBlockCacheSize() const = 0;
+
+  // Block cache size configured at startup; upper bound for resize.
+  virtual uint64_t getBlockCacheMaxSize() const = 0;
+
+  // True while a shrink is still retiring regions.
+  virtual bool isBlockCacheResizing() const = 0;
+
   // This is a temporary API to update the maxWriteRate for
   // DynamicRandomAdissionPolicy. The long term plan is to
   // support online update to this and other cache configs.

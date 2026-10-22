@@ -278,6 +278,23 @@ class NvmCache {
     return navyCache_->updateMaxRateForDynamicRandomAP(maxRate);
   }
 
+  // Online resize of the NVM block cache (large item engine). Shrinking
+  // evicts the items in the released space and punches holes in the cache
+  // file(s) / discards on block devices, asynchronously. See
+  // navy::AbstractCache::resizeBlockCache.
+  uint64_t resizeBlockCache(uint64_t newSize) {
+    return navyCache_->resizeBlockCache(newSize);
+  }
+  uint64_t getBlockCacheSize() const {
+    return navyCache_->getBlockCacheSize();
+  }
+  uint64_t getBlockCacheMaxSize() const {
+    return navyCache_->getBlockCacheMaxSize();
+  }
+  bool isBlockCacheResizing() const {
+    return navyCache_->isBlockCacheResizing();
+  }
+
   // Set the EventTracker for all underlying NVM engines
   void setEventTracker(EventTracker* tracker) {
     if (navyCache_) {

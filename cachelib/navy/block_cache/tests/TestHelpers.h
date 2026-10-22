@@ -44,6 +44,13 @@ class MockPolicy : public EvictionPolicy {
       fifo_.touch(rid);
     });
     ON_CALL(*this, evict()).WillByDefault([this] { return fifo_.evict(); });
+    ON_CALL(*this, remove(_)).WillByDefault([this](RegionId rid) {
+      return fifo_.remove(rid);
+    });
+    ON_CALL(*this, removeIf(_))
+        .WillByDefault([this](const std::function<bool(RegionId)>& pred) {
+          return fifo_.removeIf(pred);
+        });
     ON_CALL(*this, reset()).WillByDefault([this]() {
       std::fill(hits_.begin(), hits_.end(), 0);
       fifo_.reset();
@@ -68,6 +75,9 @@ class MockPolicy : public EvictionPolicy {
   MOCK_METHOD1(track, void(const Region& region));
   MOCK_METHOD1(touch, void(RegionId rid));
   MOCK_METHOD0(evict, RegionId());
+  MOCK_METHOD1(remove, bool(RegionId rid));
+  MOCK_METHOD1(removeIf,
+               std::vector<RegionId>(const std::function<bool(RegionId)>&));
   MOCK_METHOD0(reset, void());
   MOCK_CONST_METHOD0(memorySize, size_t());
   MOCK_CONST_METHOD1(getCounters, void(const CounterVisitor&));

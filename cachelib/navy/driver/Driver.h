@@ -158,6 +158,12 @@ class Driver final : public AbstractCache {
   // returns the size of the space used for caching
   uint64_t getUsableSize() const override;
 
+  // Online resize of the block cache. See AbstractCache.
+  uint64_t resizeBlockCache(uint64_t newSize) override;
+  uint64_t getBlockCacheSize() const override;
+  uint64_t getBlockCacheMaxSize() const override;
+  bool isBlockCacheResizing() const override;
+
   // returns the navy stats
   void getCounters(const CounterVisitor& visitor) const override;
 

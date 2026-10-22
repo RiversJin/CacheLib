@@ -18,7 +18,10 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
+
 #include <array>
+#include <chrono>
 #include <climits>
 #include <set>
 #include <thread>
@@ -1615,6 +1618,8 @@ TEST_F(NvmCacheTest, NavyStats) {
 
   // navy::BlockCache
   EXPECT_TRUE(cs("navy_bc_size"));
+  EXPECT_TRUE(cs("navy_bc_max_size"));
+  EXPECT_TRUE(cs("navy_bc_min_size"));
   EXPECT_TRUE(cs("navy_bc_item_removed_with_no_access"));
   EXPECT_TRUE(cs("navy_bc_item_hits_avg"));
   EXPECT_TRUE(cs("navy_bc_item_hits_min"));
@@ -1645,6 +1650,12 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bc_removes"));
   EXPECT_TRUE(cs("navy_bc_num_regions"));
   EXPECT_TRUE(cs("navy_bc_num_clean_regions"));
+  EXPECT_TRUE(cs("navy_bc_num_active_regions"));
+  EXPECT_TRUE(cs("navy_bc_num_retiring_regions"));
+  EXPECT_TRUE(cs("navy_bc_num_retired_regions"));
+  EXPECT_TRUE(cs("navy_bc_region_retires"));
+  EXPECT_TRUE(cs("navy_bc_region_reactivations"));
+  EXPECT_TRUE(cs("navy_bc_region_retire_discard_errors"));
   EXPECT_TRUE(cs("navy_bc_num_clean_region_retries"));
   EXPECT_TRUE(cs("navy_bc_succ_removes"));
   EXPECT_TRUE(cs("navy_bc_eviction_lookup_misses"));
@@ -1877,6 +1888,8 @@ TEST_F(NvmCacheTest, NavyStats) {
   // navy::Device
   EXPECT_TRUE(cs("navy_device_bytes_written"));
   EXPECT_TRUE(cs("navy_device_bytes_read"));
+  EXPECT_TRUE(cs("navy_device_bytes_discarded"));
+  EXPECT_TRUE(cs("navy_device_discard_errors"));
   EXPECT_TRUE(cs("navy_device_read_errors"));
   EXPECT_TRUE(cs("navy_device_write_errors"));
   EXPECT_TRUE(cs("navy_device_read_latency_us_avg"));
@@ -3360,6 +3373,130 @@ TEST_F(NvmCacheTest, AccessTimeMapSurvivesWarmRoll) {
   ASSERT_NE(std::nullopt, recoveredTime)
       << "ATM entry missing after warm restart";
   EXPECT_EQ(savedTime, *recoveredTime);
+}
+
+TEST_F(NvmCacheTest, ResizeBlockCache) {
+  // Block cache only; 4MB regions on a 200MB file
+  this->config_.bigHash().setSizePctAndMaxItemSize(0, 100);
+  LruAllocator::NvmCacheConfig nvmConfig;
+  nvmConfig.navyConfig = config_;
+  this->allocConfig_.enableNvmCache(nvmConfig);
+  this->makeCache();
+
+  auto& nvm = this->cache();
+  auto pid = this->poolId();
+  const auto maxSize = nvm.getNvmBlockCacheMaxSize();
+  ASSERT_GT(maxSize, 0u);
+  ASSERT_EQ(maxSize, nvm.getNvmBlockCacheSize());
+  ASSERT_FALSE(nvm.isNvmBlockCacheResizing());
+
+  // Push ~24MB into navy, i.e. a good handful of 4MB regions.
+  const int nKeys = 1600;
+  for (int i = 0; i < nKeys; i++) {
+    auto it = nvm.allocate(pid, fmt::format("key{}", i), 15 * 1024);
+    ASSERT_NE(nullptr, it);
+    nvm.insertOrReplace(it);
+    if (i % 100 == 0) {
+      nvm.flushNvmCache();
+    }
+  }
+  nvm.flushNvmCache();
+  ASSERT_LT(0u, this->evictionCount());
+
+  const auto navyFile = this->cacheDir_ + "/navy";
+  struct stat before;
+  ASSERT_EQ(0, ::stat(navyFile.c_str(), &before));
+
+  // Shrink to the smallest size the engine allows (a few regions): most of
+  // what was written has to go.
+  const uint64_t regionSize = 4 * 1024 * 1024;
+  const auto newSize = nvm.resizeNvmBlockCache(regionSize);
+  ASSERT_LT(newSize, maxSize);
+  ASSERT_EQ(0u, newSize % regionSize);
+  ASSERT_EQ(newSize, nvm.getNvmBlockCacheSize());
+  ASSERT_EQ(maxSize, nvm.getNvmBlockCacheMaxSize());
+
+  // Asynchronous: wait for the retirements to finish
+  for (int i = 0; i < 10000 && nvm.isNvmBlockCacheResizing(); i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  ASSERT_FALSE(nvm.isNvmBlockCacheResizing());
+  nvm.flushNvmCache();
+
+  // The cache file keeps its size but gives blocks back to the file system
+  struct stat after;
+  ASSERT_EQ(0, ::stat(navyFile.c_str(), &after));
+  EXPECT_EQ(before.st_size, after.st_size);
+  EXPECT_LT(after.st_blocks, before.st_blocks);
+
+  // Only what fits in the remaining regions is still there
+  int found = 0;
+  for (int i = 0; i < nKeys; i++) {
+    if (this->fetch(fmt::format("key{}", i), false /* ramOnly */)) {
+      found++;
+    }
+  }
+  nvm.flushNvmCache();
+  EXPECT_LT(found, nKeys);
+  // Everything in RAM is still there at least
+  EXPECT_GT(found, 0);
+
+  auto stats = nvm.getNvmCacheStatsMap();
+  EXPECT_EQ(newSize / regionSize, stats.getCounts().at("navy_bc_num_active_regions"));
+  EXPECT_EQ(0, stats.getCounts().at("navy_bc_num_retiring_regions"));
+  EXPECT_GT(stats.getCounts().at("navy_bc_num_retired_regions"), 0);
+
+  // Grow back and keep caching
+  ASSERT_EQ(maxSize, nvm.resizeNvmBlockCache(maxSize));
+  ASSERT_EQ(maxSize, nvm.getNvmBlockCacheSize());
+  ASSERT_FALSE(nvm.isNvmBlockCacheResizing());
+  for (int i = 0; i < 200; i++) {
+    auto it = nvm.allocate(pid, fmt::format("new{}", i), 15 * 1024);
+    ASSERT_NE(nullptr, it);
+    nvm.insertOrReplace(it);
+  }
+  nvm.flushNvmCache();
+  for (int i = 0; i < 200; i++) {
+    ASSERT_TRUE(this->checkKeyExists(fmt::format("new{}", i), false));
+  }
+}
+
+TEST_F(NvmCacheTest, ResizeBlockCacheWarmRoll) {
+  this->config_.bigHash().setSizePctAndMaxItemSize(0, 100);
+  LruAllocator::NvmCacheConfig nvmConfig;
+  nvmConfig.navyConfig = config_;
+  this->allocConfig_.enableNvmCache(nvmConfig);
+  this->convertToShmCache();
+
+  uint64_t maxSize = 0;
+  uint64_t newSize = 0;
+  {
+    auto& nvm = this->cache();
+    auto pid = this->poolId();
+    maxSize = nvm.getNvmBlockCacheMaxSize();
+    for (int i = 0; i < 400; i++) {
+      auto it = nvm.allocate(pid, fmt::format("key{}", i), 15 * 1024);
+      ASSERT_NE(nullptr, it);
+      nvm.insertOrReplace(it);
+    }
+    nvm.flushNvmCache();
+    newSize = nvm.resizeNvmBlockCache(maxSize / 2);
+    ASSERT_LT(newSize, maxSize);
+    for (int i = 0; i < 10000 && nvm.isNvmBlockCacheResizing(); i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    ASSERT_FALSE(nvm.isNvmBlockCacheResizing());
+  }
+
+  // The shrink survives a restart
+  this->warmRoll();
+  {
+    auto& nvm = this->cache();
+    EXPECT_EQ(newSize, nvm.getNvmBlockCacheSize());
+    EXPECT_EQ(maxSize, nvm.getNvmBlockCacheMaxSize());
+    EXPECT_FALSE(nvm.isNvmBlockCacheResizing());
+    EXPECT_EQ(maxSize, nvm.resizeNvmBlockCache(maxSize));
+  }
 }
 
 } // namespace tests

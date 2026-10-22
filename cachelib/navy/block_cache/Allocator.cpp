@@ -141,6 +141,22 @@ void Allocator::flush() {
   }
 }
 
+uint32_t Allocator::releaseRegionsIf(
+    const std::function<bool(RegionId)>& pred) {
+  uint32_t released = 0;
+  for (auto& ras : allocators_) {
+    for (auto& ra : ras) {
+      std::lock_guard lock{ra.getLock()};
+      auto rid = ra.getAllocationRegion();
+      if (rid.valid() && pred(rid)) {
+        flushAndReleaseRegionFromRALocked(ra, true /* async */);
+        released++;
+      }
+    }
+  }
+  return released;
+}
+
 void Allocator::reset() {
   allocRetryWaits_.set(0);
   regionManager_.reset();

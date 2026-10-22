@@ -53,6 +53,57 @@ RegionId FifoPolicy::evict() {
   return rid;
 }
 
+namespace detail {
+// Node has const members, so it can't be erased from a deque in place.
+// Rebuild the queue without the nodes matching @pred instead, in one pass,
+// appending the removed region ids to @removed.
+void removeFromQueueIf(std::deque<Node>& queue,
+                       const std::function<bool(RegionId)>& pred,
+                       std::vector<RegionId>& removed) {
+  std::deque<Node> kept;
+  const auto before = removed.size();
+  for (const auto& node : queue) {
+    if (pred(node.rid)) {
+      removed.push_back(node.rid);
+    } else {
+      kept.push_back(node);
+    }
+  }
+  if (removed.size() != before) {
+    queue.swap(kept);
+  }
+}
+
+bool removeFromQueue(std::deque<Node>& queue, RegionId rid) {
+  std::vector<RegionId> removed;
+  bool found = false;
+  removeFromQueueIf(
+      queue,
+      [&](RegionId r) {
+        if (!found && r == rid) {
+          found = true;
+          return true;
+        }
+        return false;
+      },
+      removed);
+  return found;
+}
+} // namespace detail
+
+bool FifoPolicy::remove(RegionId rid) {
+  std::lock_guard lock{mutex_};
+  return detail::removeFromQueue(queue_, rid);
+}
+
+std::vector<RegionId> FifoPolicy::removeIf(
+    const std::function<bool(RegionId)>& pred) {
+  std::vector<RegionId> removed;
+  std::lock_guard lock{mutex_};
+  detail::removeFromQueueIf(queue_, pred, removed);
+  return removed;
+}
+
 void FifoPolicy::reset() {
   std::lock_guard lock{mutex_};
   queue_.clear();
@@ -136,6 +187,30 @@ RegionId SegmentedFifoPolicy::evict() {
   lowestPri.pop_front();
   rebalanceLocked();
   return rid;
+}
+
+bool SegmentedFifoPolicy::remove(RegionId rid) {
+  std::lock_guard lock{mutex_};
+  for (auto& segment : segments_) {
+    if (detail::removeFromQueue(segment, rid)) {
+      rebalanceLocked();
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<RegionId> SegmentedFifoPolicy::removeIf(
+    const std::function<bool(RegionId)>& pred) {
+  std::vector<RegionId> removed;
+  std::lock_guard lock{mutex_};
+  for (auto& segment : segments_) {
+    detail::removeFromQueueIf(segment, pred, removed);
+  }
+  if (!removed.empty()) {
+    rebalanceLocked();
+  }
+  return removed;
 }
 
 void SegmentedFifoPolicy::rebalanceLocked() {

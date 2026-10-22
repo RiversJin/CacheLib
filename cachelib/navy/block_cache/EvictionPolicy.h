@@ -17,7 +17,9 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <vector>
 
 #include "cachelib/navy/block_cache/Region.h"
 #include "cachelib/navy/block_cache/Types.h"
@@ -41,6 +43,19 @@ class EvictionPolicy {
 
   // Evicts a region and stops tracking.
   virtual RegionId evict() = 0;
+
+  // Stops tracking a specific region regardless of its eviction order. Used
+  // when a region is taken out of service (e.g. BlockCache shrink).
+  // @return true if the region was tracked and has been removed, false if it
+  //         was not tracked by this policy.
+  virtual bool remove(RegionId rid) = 0;
+
+  // Stops tracking every region for which @pred returns true, in a single
+  // pass over the policy's state, and returns them. This is what a shrink
+  // uses to pull many regions out at once; calling remove() per region
+  // would cost O(N) each on the FIFO policies.
+  virtual std::vector<RegionId> removeIf(
+      const std::function<bool(RegionId)>& pred) = 0;
 
   // Resets policy to the initial state.
   virtual void reset() = 0;

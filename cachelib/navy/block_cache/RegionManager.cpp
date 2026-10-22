@@ -16,6 +16,11 @@
 
 #include "cachelib/navy/block_cache/RegionManager.h"
 
+#include <folly/fibers/Baton.h>
+
+#include <algorithm>
+#include <chrono>
+
 #include "cachelib/common/Profiled.h"
 #include "cachelib/common/inject_pause.h"
 #include "cachelib/navy/common/Utils.h"
@@ -61,6 +66,8 @@ RegionManager::RegionManager(uint32_t numRegions,
   for (uint32_t i = 0; i < numRegions; i++) {
     regions_[i] = std::make_unique<Region>(RegionId{i}, regionSize_);
   }
+  regionState_.assign(numRegions_, RegionState::Active);
+  numActiveRegions_.store(numRegions_, std::memory_order_release);
 
   XDCHECK_LT(0u, numInMemBuffers_);
 
@@ -103,7 +110,30 @@ void RegionManager::touch(RegionId rid) {
 void RegionManager::track(RegionId rid) {
   auto& region = getRegion(rid);
   XDCHECK_EQ(rid, region.id());
+  // The state check and the hand-over to the policy happen under the same
+  // (shared) lock, so a concurrent resize() either sees the region in the
+  // policy and removes it, or marks it before we look and we retire it
+  // here. Lock order (cleanRegionsMutex_, then the policy's own mutex) is
+  // the same as in resize().
+  std::shared_lock lock{cleanRegionsMutex_};
+  if (regionState_[rid.index()] == RegionState::Retiring) {
+    // The region was marked by resize() while it was being written or
+    // flushed. Instead of handing it to the eviction policy, evict its
+    // items right away and retire it.
+    scheduleOnWorker([this, rid]() { doReclaimRegion(rid); });
+    return;
+  }
   policy_->track(region);
+}
+
+void RegionManager::scheduleOnWorker(folly::Func func) {
+  if (isOnWorker()) {
+    // Stay on this worker: drain() waits for each worker once, so a task
+    // handed to another worker could be missed.
+    getCurrentNavyThread()->addTaskRemote(std::move(func));
+  } else {
+    getNextWorker().addTaskRemote(std::move(func));
+  }
 }
 
 void RegionManager::reset() {
@@ -120,6 +150,9 @@ void RegionManager::reset() {
     if (cleanRegionsCond_.numWaiters() > 0) {
       cleanRegionsCond_.notifyAll();
     }
+    // Back to the configured size.
+    regionState_.assign(numRegions_, RegionState::Active);
+    numActiveRegions_.store(numRegions_, std::memory_order_release);
   }
   seqNumber_.store(0, std::memory_order_release);
 
@@ -185,14 +218,14 @@ void RegionManager::releaseCleanedupRegion(RegionId rid) {
   // Reset all region internal state, making it ready to be
   // used by a region allocator.
   region.reset();
+  bool retired = false;
   {
     std::lock_guard lock{cleanRegionsMutex_};
-    cleanRegions_.push_back(rid);
-    cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
+    retired = returnToCleanPoolLocked(rid);
     INJECT_PAUSE(pause_blockcache_clean_free_locked);
-    if (cleanRegionsCond_.numWaiters() > 0) {
-      cleanRegionsCond_.notifyAll();
-    }
+  }
+  if (retired) {
+    discardRegion(rid);
   }
 }
 
@@ -280,12 +313,14 @@ RegionManager::getCleanRegion(RegionId& rid, bool addWaiter) {
     XDCHECK(!waiter);
     std::tie(status, waiter) = assignBufferToRegion(rid, addWaiter);
     if (status != OpenStatus::Ready) {
-      std::lock_guard lock{cleanRegionsMutex_};
-      cleanRegions_.push_back(rid);
-      cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
-      INJECT_PAUSE(pause_blockcache_clean_free_locked);
-      if (cleanRegionsCond_.numWaiters() > 0) {
-        cleanRegionsCond_.notifyAll();
+      bool retired = false;
+      {
+        std::lock_guard lock{cleanRegionsMutex_};
+        retired = returnToCleanPoolLocked(rid);
+        INJECT_PAUSE(pause_blockcache_clean_free_locked);
+      }
+      if (retired) {
+        discardRegion(rid);
       }
     }
   } else if (status == OpenStatus::Retry) {
@@ -360,7 +395,7 @@ void RegionManager::doFlushInternal(RegionId rid) {
 }
 
 void RegionManager::startReclaim() {
-  getNextWorker().addTaskRemote([&]() { doReclaim(); });
+  scheduleOnWorker([this]() { doReclaim(); });
 }
 
 void RegionManager::doReclaim() {
@@ -372,11 +407,22 @@ void RegionManager::doReclaim() {
     if (rid.valid()) {
       break;
     }
-    // This should never happen
-    XDCHECK(false);
+    // Every active region is in the clean pool, held by an allocator, being
+    // flushed or being reclaimed. BlockCache's minimum size keeps this from
+    // happening, but never spin here: yield so that the flushes running on
+    // this worker can finish and hand their regions to the policy.
+    XLOG_EVERY_MS(ERR, 1000) << "No region to reclaim; waiting";
+    folly::fibers::Baton b;
+    b.try_wait_for(std::chrono::milliseconds(1));
   }
 
   const auto startTime = getSteadyClock();
+  evictRegionItems(rid);
+  releaseEvictedRegion(rid, startTime, true /* scheduledReclaim */);
+  INJECT_PAUSE(pause_reclaim_done);
+}
+
+void RegionManager::evictRegionItems(RegionId rid) {
   auto& region = getRegion(rid);
   bool status = region.readyForReclaim(true, allowReadDuringReclaim_);
   XDCHECK(status);
@@ -402,8 +448,17 @@ void RegionManager::doReclaim() {
       doEviction(rid, buffer.view());
     }
   }
-  releaseEvictedRegion(rid, startTime);
-  INJECT_PAUSE(pause_reclaim_done);
+}
+
+void RegionManager::doReclaimRegion(RegionId rid) {
+  // This task is the sole owner of the region: it was pulled out of the
+  // eviction policy (resize()) or never handed to it (track()). Even if a
+  // later resize() reactivated the region in the meantime we still have to
+  // reclaim it; releaseEvictedRegion() then returns it to the clean pool
+  // instead of retiring it.
+  const auto startTime = getSteadyClock();
+  evictRegionItems(rid);
+  releaseEvictedRegion(rid, startTime, false /* scheduledReclaim */);
 }
 
 RegionDescriptor RegionManager::openForRead(RegionId rid,
@@ -469,7 +524,8 @@ void RegionManager::close(RegionDescriptor&& desc) {
 }
 
 void RegionManager::releaseEvictedRegion(RegionId rid,
-                                         std::chrono::nanoseconds startTime) {
+                                         std::chrono::nanoseconds startTime,
+                                         bool scheduledReclaim) {
   auto& region = getRegion(rid);
   // Subtract the wasted bytes in the end since we're reclaiming this region now
   externalFragmentation_.sub(getRegion(rid).getFragmentationSize());
@@ -486,24 +542,205 @@ void RegionManager::releaseEvictedRegion(RegionId rid,
   // Reset all region internal state, making it ready to be
   // used by a region allocator.
   region.reset();
+  bool retired = false;
+  bool needReplacement = false;
   {
     std::lock_guard lock{cleanRegionsMutex_};
-    if (reclaimsOutstanding_ > 0) {
-      // Though this should be always > 0 at this point with normal run path, it
-      // is possible that it's 0, if we run reclaim manually (e.g. for testing)
-      reclaimsOutstanding_--;
+    retired = returnToCleanPoolLocked(rid);
+    if (scheduledReclaim) {
+      if (retired && reclaimsOutstanding_ > 0 &&
+          cleanRegions_.size() + reclaimsOutstanding_ - 1 <
+              numCleanRegions_) {
+        // A regular reclaim picked a region that resize() marked in the
+        // meantime (the policy handed it out before resize() could remove
+        // it), and the clean pool is still short: keep the outstanding
+        // count and run another reclaim. If other paths (a reactivated
+        // region, say) already refilled the pool, just retire the count.
+        needReplacement = true;
+      } else if (reclaimsOutstanding_ > 0) {
+        // Though this should be always > 0 at this point with normal run
+        // path, it is possible that it's 0, if we run reclaim manually (e.g.
+        // for testing)
+        reclaimsOutstanding_--;
+      }
     }
-    cleanRegions_.push_back(rid);
-    // Clear the fast-path flag so allocator threads will try acquiring
-    // the mutex again now that a clean region is available.
-    cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
     INJECT_PAUSE(pause_blockcache_clean_free_locked);
-    if (cleanRegionsCond_.numWaiters() > 0) {
-      cleanRegionsCond_.notifyAll();
-    }
+  }
+  if (retired) {
+    discardRegion(rid);
+  }
+  if (needReplacement) {
+    startReclaim();
   }
   reclaimTimeCountUs_.add(toMicros(getSteadyClock() - startTime).count());
   reclaimCount_.inc();
+}
+
+bool RegionManager::returnToCleanPoolLocked(RegionId rid) {
+  auto& state = regionState_[rid.index()];
+  if (state == RegionState::Retiring) {
+    // Out of service from now on, but not Retired yet: the caller still has
+    // to release the storage, and until then nobody may hand the region
+    // out again (a resize() that grows meanwhile only flips it to Active;
+    // finishDiscardLocked() then returns it to the clean pool).
+    state = RegionState::Discarding;
+    return true;
+  }
+  XDCHECK(state == RegionState::Active);
+  cleanRegions_.push_back(rid);
+  // Clear the fast-path flag so allocator threads will try acquiring
+  // the mutex again now that a clean region is available.
+  cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
+  if (cleanRegionsCond_.numWaiters() > 0) {
+    cleanRegionsCond_.notifyAll();
+  }
+  return false;
+}
+
+void RegionManager::finishDiscardLocked(RegionId rid) {
+  auto& state = regionState_[rid.index()];
+  switch (state) {
+  case RegionState::Discarding:
+    state = RegionState::Retired;
+    retiredCount_.inc();
+    break;
+  case RegionState::Retiring:
+    // Reactivated and retired again while the discard was in flight. We
+    // own the region and nothing was written to it, so it is retired as is.
+    state = RegionState::Retired;
+    retiredCount_.inc();
+    break;
+  case RegionState::Active:
+    // Reactivated while the discard was in flight: hand it over now.
+    cleanRegions_.push_back(rid);
+    cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
+    if (cleanRegionsCond_.numWaiters() > 0) {
+      cleanRegionsCond_.notifyAll();
+    }
+    break;
+  case RegionState::Retired:
+    XDCHECK(false) << "region retired while its discard was in flight";
+    break;
+  }
+}
+
+void RegionManager::discardRegion(RegionId rid) {
+  INJECT_PAUSE(pause_retire_discard_begin);
+  const auto offset = physicalOffset(RelAddress{rid, 0});
+  if (!device_.discard(offset, regionSize_)) {
+    // The region is still out of service; only the physical release failed.
+    retireDiscardErrors_.inc();
+    XLOG_EVERY_MS(ERR, 10'000) << fmt::format(
+        "Failed to discard retired region {} (offset {}, size {})",
+        rid.index(), offset, regionSize_);
+  }
+  std::lock_guard lock{cleanRegionsMutex_};
+  finishDiscardLocked(rid);
+}
+
+uint32_t RegionManager::resize(uint32_t numActive) {
+  numActive = std::clamp<uint32_t>(numActive, 1, numRegions_);
+  std::vector<RegionId> toReclaim;
+  std::vector<RegionId> toDiscard;
+  bool anyRetiring = false;
+  {
+    std::lock_guard lock{cleanRegionsMutex_};
+    const auto prevActive = numActiveRegions_.load(std::memory_order_acquire);
+    numActiveRegions_.store(numActive, std::memory_order_release);
+    XLOGF(INFO, "Resize block cache: {} -> {} active regions (of {})",
+          prevActive, numActive, numRegions_);
+
+    for (uint32_t i = 0; i < numRegions_; i++) {
+      const RegionId rid{i};
+      auto& state = regionState_[i];
+      if (i < numActive) {
+        // Must be in service.
+        if (state == RegionState::Retired) {
+          // Discarded and reset; usable right away.
+          state = RegionState::Active;
+          cleanRegions_.push_back(rid);
+          reactivatedCount_.inc();
+        } else if (state == RegionState::Retiring ||
+                   state == RegionState::Discarding) {
+          // Reclaim or discard is still in flight; the task that owns the
+          // region returns it to the clean pool when it is done
+          // (releaseEvictedRegion() / finishDiscardLocked()).
+          state = RegionState::Active;
+          reactivatedCount_.inc();
+        }
+        continue;
+      }
+      // Must be out of service.
+      if (state == RegionState::Active) {
+        state = RegionState::Retiring;
+        anyRetiring = true;
+      }
+    }
+    if (anyRetiring) {
+      // Everything below is a single pass per container, so that retiring
+      // many regions at once costs O(N) while this lock is held.
+      //
+      // Sitting in the clean pool: nothing to evict, only the storage to
+      // release.
+      auto it = std::remove_if(
+          cleanRegions_.begin(), cleanRegions_.end(), [&](RegionId rid) {
+            auto& s = regionState_[rid.index()];
+            if (s != RegionState::Retiring) {
+              return false;
+            }
+            s = RegionState::Discarding;
+            toDiscard.push_back(rid);
+            return true;
+          });
+      cleanRegions_.erase(it, cleanRegions_.end());
+      // Tracked by the eviction policy: pull them out and reclaim them now.
+      toReclaim = policy_->removeIf([this](RegionId rid) {
+        return regionState_[rid.index()] == RegionState::Retiring;
+      });
+      // Whatever is still Retiring is held by an allocator, being flushed,
+      // being reclaimed or (if it was reactivated during its discard) being
+      // discarded. track() / releaseEvictedRegion() /
+      // releaseCleanedupRegion() / finishDiscardLocked() check the state on
+      // the way out and retire it then. The allocator is asked to let go of
+      // its regions by BlockCache::resize().
+    }
+    if (!cleanRegions_.empty()) {
+      cleanRegionsEmpty_.store(false, std::memory_order_relaxed);
+      if (cleanRegionsCond_.numWaiters() > 0) {
+        cleanRegionsCond_.notifyAll();
+      }
+    }
+  }
+  // Both kinds of work run on the workers: the device discard can be slow
+  // (hole punching a 16MB range on a busy file system), and the caller is
+  // promised an immediate return.
+  for (auto rid : toDiscard) {
+    scheduleOnWorker([this, rid]() { discardRegion(rid); });
+  }
+  for (auto rid : toReclaim) {
+    scheduleOnWorker([this, rid]() { doReclaimRegion(rid); });
+  }
+  return numActive;
+}
+
+bool RegionManager::isRetiringOrRetired(RegionId rid) const {
+  std::shared_lock lock{cleanRegionsMutex_};
+  return regionState_[rid.index()] != RegionState::Active;
+}
+
+uint32_t RegionManager::numRetiringRegions() const {
+  std::shared_lock lock{cleanRegionsMutex_};
+  uint32_t n = 0;
+  for (auto s : regionState_) {
+    n += s == RegionState::Retiring || s == RegionState::Discarding;
+  }
+  return n;
+}
+
+uint32_t RegionManager::numRetiredRegions() const {
+  std::shared_lock lock{cleanRegionsMutex_};
+  return std::count(regionState_.begin(), regionState_.end(),
+                    RegionState::Retired);
 }
 
 void RegionManager::doEviction(RegionId rid, BufferView buffer) const {
@@ -545,6 +782,20 @@ void RegionManager::persist(RecordWriter& rw) const {
     *regionProto.numItems() = regions_[i]->getNumItems();
   }
 
+  {
+    // Persist the shrink. Only fully retired regions at the tail are
+    // excluded; a region whose reclaim is still pending is kept in service
+    // so its index entries stay valid after recovery. The caller may simply
+    // resize() again after recovery.
+    std::shared_lock lock{cleanRegionsMutex_};
+    uint32_t numActive = numRegions_;
+    while (numActive > 0 &&
+           regionState_[numActive - 1] == RegionState::Retired) {
+      numActive--;
+    }
+    regionData.numActiveRegions() = numActive;
+  }
+
   if (recoverEvictionPolicy_) {
     try {
       serialization::EvictionPolicyData policyData;
@@ -582,6 +833,32 @@ void RegionManager::recover(RecordReader& rr) {
     }
     regions_[index] =
         std::make_unique<Region>(regionProto, *regionData.regionSize());
+  }
+
+  {
+    std::lock_guard lock{cleanRegionsMutex_};
+    uint32_t numActive = numRegions_;
+    if (regionData.numActiveRegions().has_value()) {
+      auto persisted = *regionData.numActiveRegions();
+      if (persisted < 1 || static_cast<uint32_t>(persisted) > numRegions_) {
+        throw std::invalid_argument(
+            "Could not recover RegionManager. Invalid numActiveRegions.");
+      }
+      numActive = persisted;
+    }
+    for (uint32_t i = 0; i < numRegions_; i++) {
+      regionState_[i] =
+          i < numActive ? RegionState::Active : RegionState::Retired;
+      if (i >= numActive && regions_[i]->getNumItems() != 0) {
+        throw std::invalid_argument(
+            "Could not recover RegionManager. Retired region is not empty.");
+      }
+    }
+    numActiveRegions_.store(numActive, std::memory_order_release);
+    if (numActive != numRegions_) {
+      XLOGF(INFO, "Recovered block cache with {} of {} regions active",
+            numActive, numRegions_);
+    }
   }
 
   // Try to recover eviction policy from persisted data, or fall back to
@@ -644,13 +921,20 @@ void RegionManager::restoreUntrackedRegions(
   std::lock_guard lock{cleanRegionsMutex_};
   for (uint32_t i = 0; i < numRegions_; i++) {
     if (tracked[i]) {
+      if (regionState_[i] == RegionState::Retired) {
+        throw std::invalid_argument(
+            "Persisted policy contains a retired region id");
+      }
+      continue;
+    }
+    if (regionState_[i] == RegionState::Retired) {
       continue;
     }
     if (regions_[i]->getNumItems() == 0 &&
         cleanRegions_.size() < numCleanRegions_) {
       cleanRegions_.emplace_back(i);
     } else {
-      track(RegionId{i});
+      policy_->track(*regions_[i]);
     }
   }
 }
@@ -669,18 +953,22 @@ void RegionManager::resetEvictionPolicy() {
   policy_->reset();
   recomputeFragmentation();
 
+  // Retired regions stay out of the policy. Called from the constructor,
+  // reset() and recover(), none of which run concurrently with resize().
+  const auto numActive = numActiveRegions();
+
   // Track all empty regions first
-  for (uint32_t i = 0; i < numRegions_; i++) {
+  for (uint32_t i = 0; i < numActive; i++) {
     if (regions_[i]->getNumItems() == 0) {
-      track(RegionId{i});
+      policy_->track(*regions_[i]);
     }
   }
 
   // Now track all non-empty regions. This should ensure empty regions are
   // pushed to the bottom for both LRU and FIFO policies.
-  for (uint32_t i = 0; i < numRegions_; i++) {
+  for (uint32_t i = 0; i < numActive; i++) {
     if (regions_[i]->getNumItems() != 0) {
-      track(RegionId{i});
+      policy_->track(*regions_[i]);
     }
   }
 }
@@ -759,11 +1047,27 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_num_regions", numRegions_);
   size_t numCleanRegions;
+  size_t numRetiring = 0;
+  size_t numRetired = 0;
   {
     std::shared_lock lock{cleanRegionsMutex_};
     numCleanRegions = cleanRegions_.size();
+    for (auto s : regionState_) {
+      numRetiring +=
+          s == RegionState::Retiring || s == RegionState::Discarding;
+      numRetired += s == RegionState::Retired;
+    }
   }
   visitor("navy_bc_num_clean_regions", numCleanRegions);
+  visitor("navy_bc_num_active_regions", numActiveRegions());
+  visitor("navy_bc_num_retiring_regions", numRetiring);
+  visitor("navy_bc_num_retired_regions", numRetired);
+  visitor("navy_bc_region_retires", retiredCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_region_reactivations", reactivatedCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_region_retire_discard_errors", retireDiscardErrors_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_num_clean_region_retries", cleanRegionRetries_.get(),
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_external_fragmentation", externalFragmentation_.get());

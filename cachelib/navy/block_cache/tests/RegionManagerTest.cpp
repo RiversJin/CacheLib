@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "cachelib/common/inject_pause.h"
@@ -987,6 +988,199 @@ TEST(RegionManager, EvictionPolicyRecoverRestoresCleanRegions) {
       }
     }});
     EXPECT_EQ(2u, cleanCount);
+  }
+}
+
+TEST(RegionManager, ResizeShrinkAndGrow) {
+  constexpr uint32_t kNumRegions = 4;
+  constexpr uint32_t kRegionSize = 4 * 1024;
+  constexpr uint64_t kBaseOffset = 1024;
+  auto device = createMemoryDevice(kBaseOffset + kNumRegions * kRegionSize,
+                                   nullptr /* encryption */);
+  std::vector<uint32_t> evicted(kNumRegions);
+  RegionEvictCallback evictCb{[&evicted](RegionId rid, BufferView) {
+    evicted[rid.index()]++;
+    return 0;
+  }};
+  RegionCleanupCallback cleanupCb{[](RegionId, BufferView) {}};
+  auto rm = std::make_unique<RegionManager>(
+      kNumRegions, kRegionSize, kBaseOffset, *device, 1, 1, 0,
+      std::move(evictCb), std::move(cleanupCb), std::make_unique<LruPolicy>(4),
+      kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
+      true /* workerFlushAsync */);
+
+  EXPECT_EQ(kNumRegions, rm->numActiveRegions());
+  EXPECT_EQ(kNumRegions * kRegionSize, rm->getSize());
+  EXPECT_EQ(kNumRegions * kRegionSize, rm->getMaxSize());
+
+  // Put something in region 3 so we can see it being evicted
+  rm->getRegion(RegionId{3}).attachBuffer(std::make_unique<Buffer>(kRegionSize));
+  {
+    auto [desc, _, _2] = rm->getRegion(RegionId{3}).openAndAllocate(101);
+    rm->getRegion(RegionId{3}).close(std::move(desc));
+  }
+  EXPECT_EQ(Region::FlushRes::kSuccess, rm->flushBuffer(RegionId{3}));
+  rm->detachBuffer(RegionId{3});
+
+  // Shrink to 2 regions: 2 and 3 are pulled out of the policy and reclaimed
+  // on the worker.
+  EXPECT_EQ(2u, rm->resize(2));
+  EXPECT_EQ(2u, rm->numActiveRegions());
+  EXPECT_EQ(2 * kRegionSize, rm->getSize());
+  EXPECT_EQ(kNumRegions * kRegionSize, rm->getMaxSize());
+  EXPECT_TRUE(rm->isRetiringOrRetired(RegionId{2}));
+  EXPECT_TRUE(rm->isRetiringOrRetired(RegionId{3}));
+  EXPECT_FALSE(rm->isRetiringOrRetired(RegionId{1}));
+  rm->drain();
+  EXPECT_EQ(0u, rm->numRetiringRegions());
+  EXPECT_EQ(2u, rm->numRetiredRegions());
+  EXPECT_EQ(1u, evicted[3]);
+  EXPECT_EQ(0u, rm->getRegion(RegionId{3}).getNumItems());
+  EXPECT_EQ(2 * kRegionSize, device->getBytesDiscarded());
+
+  // Only regions 0 and 1 are handed out from now on
+  for (int i = 0; i < 4; i++) {
+    RegionId rid;
+    rm->startReclaim();
+    rm->drain();
+    ASSERT_EQ(OpenStatus::Ready, rm->getCleanRegion(rid, false).first);
+    EXPECT_LT(rid.index(), 2u);
+    rm->detachBuffer(rid);
+    rm->track(rid);
+  }
+
+  // Grow back: 2 and 3 come back as clean regions right away
+  EXPECT_EQ(kNumRegions, rm->resize(kNumRegions));
+  EXPECT_EQ(kNumRegions * kRegionSize, rm->getSize());
+  EXPECT_EQ(0u, rm->numRetiredRegions());
+  EXPECT_FALSE(rm->isRetiringOrRetired(RegionId{3}));
+  {
+    RegionId rid;
+    ASSERT_EQ(OpenStatus::Ready, rm->getCleanRegion(rid, false).first);
+    EXPECT_EQ(3u, rid.index());
+    rm->detachBuffer(rid);
+    rm->track(rid);
+    ASSERT_EQ(OpenStatus::Ready, rm->getCleanRegion(rid, false).first);
+    EXPECT_EQ(2u, rid.index());
+    rm->detachBuffer(rid);
+    rm->track(rid);
+  }
+  rm->drain();
+
+  // Out of range requests are clamped
+  EXPECT_EQ(kNumRegions, rm->resize(100));
+  EXPECT_EQ(1u, rm->resize(0));
+  rm->drain();
+  EXPECT_EQ(3u, rm->numRetiredRegions());
+  EXPECT_EQ(kNumRegions, rm->resize(kNumRegions));
+  rm->drain();
+}
+
+// A region whose device discard is still in flight must not be handed out
+// again when the cache grows in the meantime; it joins the clean pool only
+// once the discard is done.
+TEST(RegionManager, ResizeGrowDuringDiscard) {
+  constexpr uint32_t kNumRegions = 4;
+  constexpr uint32_t kRegionSize = 4 * 1024;
+  auto device =
+      createMemoryDevice(kNumRegions * kRegionSize, nullptr /* encryption */);
+  RegionEvictCallback evictCb{[](RegionId, BufferView) { return 0; }};
+  RegionCleanupCallback cleanupCb{[](RegionId, BufferView) {}};
+  auto rm = std::make_unique<RegionManager>(
+      kNumRegions, kRegionSize, 0, *device, 1, 1, 0, std::move(evictCb),
+      std::move(cleanupCb), std::make_unique<FifoPolicy>(),
+      kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
+      true /* workerFlushAsync */);
+
+  ENABLE_INJECT_PAUSE_IN_SCOPE();
+  injectPauseSet("pause_retire_discard_begin");
+
+  // Regions 2 and 3 are pulled out of the policy and reclaimed on the
+  // worker (as two fibers); both stop in front of their discard.
+  EXPECT_EQ(2u, rm->resize(2));
+  EXPECT_TRUE(injectPauseWait("pause_retire_discard_begin", 2,
+                              false /* wakeup */));
+  // Evicted and reset, but the storage has not been released: not done.
+  EXPECT_EQ(2u, rm->numRetiringRegions());
+  EXPECT_EQ(0u, rm->numRetiredRegions());
+  EXPECT_EQ(0u, device->getBytesDiscarded());
+
+  // Grow back while the discards are paused: nothing may be handed out yet.
+  EXPECT_EQ(kNumRegions, rm->resize(kNumRegions));
+  EXPECT_FALSE(rm->isRetiringOrRetired(RegionId{2}));
+  EXPECT_FALSE(rm->isRetiringOrRetired(RegionId{3}));
+  {
+    RegionId rid;
+    EXPECT_EQ(OpenStatus::Retry, rm->getCleanRegion(rid, false).first);
+  }
+
+  // Let the discards finish; the regions are active again, so they go to
+  // the clean pool instead of being retired.
+  EXPECT_EQ(1u, injectPauseClear("pause_retire_discard_begin"));
+  rm->drain();
+  EXPECT_EQ(2 * kRegionSize, device->getBytesDiscarded());
+  EXPECT_EQ(0u, rm->numRetiringRegions());
+  EXPECT_EQ(0u, rm->numRetiredRegions());
+
+  // Both regions are available now (plus whatever the Retry above
+  // reclaimed to refill the pool).
+  std::set<uint32_t> got;
+  for (int i = 0; i < 3; i++) {
+    RegionId rid;
+    if (rm->getCleanRegion(rid, false).first == OpenStatus::Ready) {
+      got.insert(rid.index());
+      rm->detachBuffer(rid);
+      // keep the policy populated so refills always find a victim
+      rm->track(rid);
+    }
+    rm->drain();
+  }
+  EXPECT_TRUE(got.count(2));
+  EXPECT_TRUE(got.count(3));
+}
+
+TEST(RegionManager, ResizeRecovery) {
+  constexpr uint32_t kNumRegions = 4;
+  constexpr uint32_t kRegionSize = 4 * 1024;
+  auto device =
+      createMemoryDevice(kNumRegions * kRegionSize, nullptr /* encryption */);
+  folly::IOBufQueue ioq;
+  {
+    RegionEvictCallback evictCb{[](RegionId, BufferView) { return 0; }};
+    RegionCleanupCallback cleanupCb{[](RegionId, BufferView) {}};
+    auto rm = std::make_unique<RegionManager>(
+        kNumRegions, kRegionSize, 0, *device, 1, 1, 0, std::move(evictCb),
+        std::move(cleanupCb), std::make_unique<FifoPolicy>(),
+        kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
+        true /* workerFlushAsync */);
+    rm->resize(3);
+    rm->drain();
+    EXPECT_EQ(1u, rm->numRetiredRegions());
+    auto rw = createMemoryRecordWriter(ioq);
+    rm->persist(*rw);
+  }
+  {
+    RegionEvictCallback evictCb{[](RegionId, BufferView) { return 0; }};
+    RegionCleanupCallback cleanupCb{[](RegionId, BufferView) {}};
+    auto rm = std::make_unique<RegionManager>(
+        kNumRegions, kRegionSize, 0, *device, 1, 1, 0, std::move(evictCb),
+        std::move(cleanupCb), std::make_unique<FifoPolicy>(),
+        kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit,
+        true /* workerFlushAsync */);
+    EXPECT_EQ(kNumRegions, rm->numActiveRegions());
+    auto rr = createMemoryRecordReader(ioq);
+    rm->recover(*rr);
+    EXPECT_EQ(3u, rm->numActiveRegions());
+    EXPECT_EQ(1u, rm->numRetiredRegions());
+    EXPECT_EQ(3 * kRegionSize, rm->getSize());
+    // Region 3 is never offered for eviction
+    EXPECT_EQ(0u, rm->evict().index());
+    EXPECT_EQ(1u, rm->evict().index());
+    EXPECT_EQ(2u, rm->evict().index());
+    EXPECT_FALSE(rm->evict().valid());
+    // reset() brings everything back
+    rm->reset();
+    EXPECT_EQ(kNumRegions, rm->numActiveRegions());
   }
 }
 } // namespace facebook::cachelib::navy::tests

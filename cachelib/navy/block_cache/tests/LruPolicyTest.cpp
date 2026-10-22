@@ -105,4 +105,56 @@ TEST(EvictionPolicy, LruReset) {
   policy.reset();
   EXPECT_EQ(kNone, policy.evict());
 }
+
+TEST(EvictionPolicy, LruRemove) {
+  LruPolicy policy{4};
+  policy.track(kRegion0);
+  policy.track(kRegion1);
+  policy.track(kRegion2);
+  policy.track(kRegion3);
+  policy.touch(kR0);
+  // Remove head, tail and something untracked
+  EXPECT_TRUE(policy.remove(kR0));
+  EXPECT_FALSE(policy.remove(kR0));
+  EXPECT_TRUE(policy.remove(kR1));
+  EXPECT_FALSE(policy.remove(RegionId{9}));
+  EXPECT_EQ(kR2, policy.evict());
+  EXPECT_EQ(kR3, policy.evict());
+  EXPECT_EQ(kNone, policy.evict());
+  // Removed regions can be tracked again
+  policy.track(kRegion0);
+  EXPECT_EQ(kR0, policy.evict());
+  EXPECT_EQ(kNone, policy.evict());
+
+  // The only node of the list has no links but is still tracked
+  policy.track(kRegion2);
+  EXPECT_TRUE(policy.remove(kR2));
+  EXPECT_FALSE(policy.remove(kR2));
+  EXPECT_EQ(kNone, policy.evict());
+  policy.track(kRegion2);
+  policy.track(kRegion3);
+  EXPECT_EQ(kR2, policy.evict());
+  EXPECT_TRUE(policy.remove(kR3));
+  EXPECT_EQ(kNone, policy.evict());
+}
+
+TEST(EvictionPolicy, LruRemoveIf) {
+  LruPolicy policy{4};
+  policy.track(kRegion0);
+  policy.track(kRegion1);
+  policy.track(kRegion2);
+  policy.track(kRegion3);
+  policy.touch(kR1);
+  // Remove head, tail and one in the middle in a single walk
+  auto removed = policy.removeIf([](RegionId rid) { return rid.index() != 2; });
+  ASSERT_EQ(3u, removed.size());
+  EXPECT_EQ(kR2, policy.evict());
+  EXPECT_EQ(kNone, policy.evict());
+  // Removed regions can be tracked again; removing everything empties it
+  policy.track(kRegion0);
+  policy.track(kRegion1);
+  EXPECT_EQ(2u, policy.removeIf([](RegionId) { return true; }).size());
+  EXPECT_EQ(kNone, policy.evict());
+  EXPECT_TRUE(policy.removeIf([](RegionId) { return true; }).empty());
+}
 } // namespace facebook::cachelib::navy::tests

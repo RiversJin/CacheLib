@@ -55,6 +55,13 @@ class FifoPolicy final : public EvictionPolicy {
   // Evicts the first added region and stops tracking.
   RegionId evict() override;
 
+  // Stops tracking @rid. O(queue size).
+  bool remove(RegionId rid) override;
+
+  // Stops tracking every region matching @pred. One pass, O(queue size).
+  std::vector<RegionId> removeIf(
+      const std::function<bool(RegionId)>& pred) override;
+
   // Resets FIFO policy to the initial state.
   void reset() override;
 
@@ -128,6 +135,13 @@ class SegmentedFifoPolicy final : public EvictionPolicy {
 
   // Evicts the region with the lowest priority and stops tracking.
   RegionId evict() override;
+
+  // Stops tracking @rid from whichever segment holds it. O(total size).
+  bool remove(RegionId rid) override;
+
+  // Stops tracking every region matching @pred, then rebalances once.
+  std::vector<RegionId> removeIf(
+      const std::function<bool(RegionId)>& pred) override;
 
   // Resets Segmented FIFO policy to the initial state.
   void reset() override;

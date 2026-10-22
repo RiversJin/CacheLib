@@ -28,6 +28,13 @@
 #include <folly/io/async/EventHandler.h>
 #include <folly/io/async/IoUring.h>
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#endif
+
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -332,6 +339,8 @@ class FileDevice : public Device {
 
   void flushImpl() override;
 
+  bool discardImpl(uint64_t offset, uint64_t size) override;
+
   int allocatePlacementHandle() override;
 
   // File vector for devices or regular files
@@ -426,8 +435,57 @@ class MemoryDevice final : public Device {
     // Noop
   }
 
+  // Nothing to give back to the OS; zero the range so the data is gone the
+  // same way it would be on a real device.
+  bool discardImpl(uint64_t offset, uint64_t size) override {
+    XDCHECK_LE(offset + size, getSize());
+    std::memset(buffer_.get() + offset, 0, size);
+    return true;
+  }
+
   std::unique_ptr<uint8_t[]> buffer_;
 };
+
+// Releases [offset, offset + size) of a single fd: punch a hole in a regular
+// file, discard (TRIM) on a block device.
+bool discardFileRange(int fd, uint64_t offset, uint64_t size) {
+  struct stat st;
+  if (::fstat(fd, &st) < 0) {
+    XLOGF(ERR, "discard: fstat failed, errno {}", errno);
+    return false;
+  }
+  if (S_ISREG(st.st_mode)) {
+#if defined(__linux__) && !defined(MISSING_FALLOCATE)
+    if (::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset,
+                    size) < 0) {
+      XLOGF(ERR, "discard: fallocate(PUNCH_HOLE) offset {} size {} errno {}",
+            offset, size, errno);
+      return false;
+    }
+    return true;
+#else
+    XLOG_EVERY_MS(WARN, 60'000) << "discard: hole punching not supported";
+    return false;
+#endif
+  }
+  if (S_ISBLK(st.st_mode)) {
+#if defined(__linux__) && defined(BLKDISCARD)
+    uint64_t range[2] = {offset, size};
+    if (::ioctl(fd, BLKDISCARD, &range) < 0) {
+      XLOGF(ERR, "discard: BLKDISCARD offset {} size {} errno {}", offset, size,
+            errno);
+      return false;
+    }
+    return true;
+#else
+    XLOG_EVERY_MS(WARN, 60'000) << "discard: BLKDISCARD not supported";
+    return false;
+#endif
+  }
+  XLOG_EVERY_MS(WARN, 60'000)
+      << "discard: unsupported file type " << (st.st_mode & S_IFMT);
+  return false;
+}
 } // namespace
 
 bool Device::write(uint64_t offset, BufferView view, int placeHandle) {
@@ -569,10 +627,34 @@ bool Device::read(uint64_t offset, uint32_t size, void* value) {
   return readInternal(offset, size, value);
 }
 
+bool Device::discard(uint64_t offset, uint64_t size) {
+  XDCHECK_EQ(offset % ioAlignmentSize_, 0ul);
+  XDCHECK_EQ(size % ioAlignmentSize_, 0ul);
+  if (size == 0) {
+    return true;
+  }
+  if (offset + size > size_) {
+    XLOGF(ERR, "discard out of range: offset {} size {} device size {}", offset,
+          size, size_);
+    discardErrors_.inc();
+    return false;
+  }
+  if (!discardImpl(offset, size)) {
+    discardErrors_.inc();
+    return false;
+  }
+  bytesDiscarded_.add(size);
+  return true;
+}
+
 void Device::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_device_bytes_written", getBytesWritten(),
           CounterVisitor::CounterType::RATE);
   visitor("navy_device_bytes_read", getBytesRead(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_device_bytes_discarded", getBytesDiscarded(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_device_discard_errors", discardErrors_.get(),
           CounterVisitor::CounterType::RATE);
   visitor("navy_device_read_errors", readIOErrors_.get(),
           CounterVisitor::CounterType::RATE);
@@ -1064,6 +1146,26 @@ void FileDevice::flushImpl() {
   for (const auto& f : fvec_) {
     ::fsync(f.fd());
   }
+}
+
+bool FileDevice::discardImpl(uint64_t offset, uint64_t size) {
+  if (fvec_.size() == 1) {
+    return discardFileRange(fvec_[0].fd(), offset, size);
+  }
+  // RAID0: walk the stripes the same way IOReq splits an IO.
+  bool ok = true;
+  while (size > 0) {
+    uint64_t stripe = offset / stripeSize_;
+    uint32_t fdIdx = stripe % fvec_.size();
+    uint64_t stripeStartOffset = (stripe / fvec_.size()) * stripeSize_;
+    uint64_t offsetInStripe = offset % stripeSize_;
+    uint64_t len = std::min<uint64_t>(size, stripeSize_ - offsetInStripe);
+    ok &= discardFileRange(fvec_[fdIdx].fd(), stripeStartOffset + offsetInStripe,
+                           len);
+    size -= len;
+    offset += len;
+  }
+  return ok;
 }
 
 IoContext* FileDevice::getIoContext() {

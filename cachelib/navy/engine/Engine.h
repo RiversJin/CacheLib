@@ -38,6 +38,20 @@ class Engine {
   // return the size of usable space
   virtual uint64_t getSize() const = 0;
 
+  // Size configured at construction. Engines that support online resize
+  // (BlockCache) may serve less than this; see resize().
+  virtual uint64_t getMaxSize() const { return getSize(); }
+
+  // Changes the space in service to @newSize bytes and releases the storage
+  // of the space taken out of service. Engines that don't support it ignore
+  // the request. Shrinking may complete asynchronously; see isResizing().
+  //
+  // @return the (new) size in service
+  virtual uint64_t resize(uint64_t /* newSize */) { return getSize(); }
+
+  // True while an asynchronous shrink is still in progress.
+  virtual bool isResizing() const { return false; }
+
   // Returns true if the entry could exist. False if the entry definitely does
   // not exist.
   virtual bool couldExist(HashedKey hk) = 0;

@@ -114,10 +114,55 @@ class RegionManager {
   // Destroy the worker thread for safety first
   ~RegionManager() { workers_.clear(); }
 
-  // return the size of usable space
+  // Size of the space currently in service (active regions only). This is
+  // the target size once a shrink is in progress; see numRetiringRegions().
   uint64_t getSize() const {
+    return static_cast<uint64_t>(numActiveRegions()) * regionSize_;
+  }
+
+  // Size of the space configured at construction. Upper bound for resize().
+  uint64_t getMaxSize() const {
     return static_cast<uint64_t>(numRegions_) * regionSize_;
   }
+
+  // ---- Online resize ----
+  //
+  // Regions are numbered [0, numRegions_). Only the prefix
+  // [0, numActiveRegions()) is in service; the rest are "retired": their
+  // items have been evicted and their storage has been released with
+  // Device::discard(). Shrinking retires the highest-numbered regions,
+  // growing brings retired regions back as clean regions.
+  //
+  // Shrink is asynchronous. resize() marks the regions, kicks off the work
+  // and returns. A marked region goes through the regular reclaim path on
+  // the worker threads (so item destructors and reinsertion policies see the
+  // evictions) as soon as it is not being written to, and is then retired
+  // instead of being returned to the clean pool. Until that happens it is
+  // counted by numRetiringRegions().
+
+  // Number of regions configured at construction.
+  uint32_t numRegions() const { return numRegions_; }
+
+  // Number of regions in service, i.e. the current resize target.
+  uint32_t numActiveRegions() const {
+    return numActiveRegions_.load(std::memory_order_acquire);
+  }
+
+  // Regions marked for retirement whose retirement (reclaim and device
+  // discard) has not completed yet.
+  uint32_t numRetiringRegions() const;
+
+  // Regions fully retired (evicted and discarded).
+  uint32_t numRetiredRegions() const;
+
+  // Sets the number of regions in service to @numActive, clamped to
+  // [1, numRegions_]. Returns the effective value. Safe to call while the
+  // cache is serving traffic, and while a previous resize is still pending.
+  uint32_t resize(uint32_t numActive);
+
+  // True if @rid is marked for retirement or already retired. The allocator
+  // uses this to let go of regions it is currently writing into.
+  bool isRetiringOrRetired(RegionId rid) const;
 
   // Gets a region from a valid region ID.
   Region& getRegion(RegionId rid) {
@@ -132,7 +177,7 @@ class RegionManager {
   }
 
   const RegionId getRandomRegion() const {
-    return RegionId{folly::Random::rand32(0, numRegions_)};
+    return RegionId{folly::Random::rand32(0, numActiveRegions())};
   }
   // Flushes the in memory buffer attached to a region in either async or
   // sync mode.
@@ -269,12 +314,19 @@ class RegionManager {
   // Schedules region reclaim job to create a clean region
   void startReclaim();
 
-  // Releases a region that was evicted during region reclaim.
+  // Releases a region that was evicted during region reclaim. If the region
+  // was marked for retirement in the meantime it is retired instead of being
+  // returned to the clean pool.
   //
-  // @param rid        region ID
-  // @param startTime  time when the reclaim starts;
-  //                   it is used to count the reclaim time duration
-  void releaseEvictedRegion(RegionId rid, std::chrono::nanoseconds startTime);
+  // @param rid              region ID
+  // @param startTime        time when the reclaim starts;
+  //                         it is used to count the reclaim time duration
+  // @param scheduledReclaim whether this reclaim was counted in
+  //                         reclaimsOutstanding_ (regular reclaim) as opposed
+  //                         to a targeted reclaim issued by resize()
+  void releaseEvictedRegion(RegionId rid,
+                            std::chrono::nanoseconds startTime,
+                            bool scheduledReclaim = true);
 
   // Evicts a region by calling @evictCb_ during region reclaim.
   void doEviction(RegionId rid, BufferView buffer) const;
@@ -304,6 +356,40 @@ class RegionManager {
 
   void doReclaim();
   void doFlushInternal(RegionId rid);
+
+  // Evicts every item in @rid (reads the region, invokes evictCb_). The
+  // region must not be used by writers; see Region::readyForReclaim.
+  void evictRegionItems(RegionId rid);
+
+  // Targeted reclaim of a region marked for retirement, issued by resize().
+  void doReclaimRegion(RegionId rid);
+
+  // Punches a hole in the device range backing @rid.
+  void discardRegion(RegionId rid);
+
+  // Puts @rid back into the clean pool, or takes it out of service if it has
+  // been marked for retirement. Returns true in the latter case: the region
+  // is then in state Discarding and owned by the caller, which must call
+  // discardRegion(rid) once the lock is released.
+  // Must be called with cleanRegionsMutex_ held exclusively.
+  bool returnToCleanPoolLocked(RegionId rid);
+
+  enum class RegionState : uint8_t {
+    Active,     // in service
+    Retiring,   // marked by resize(), reclaim pending
+    Discarding, // evicted and reset; Device::discard() in flight. Owned by
+                // the discarding task, which hands it over when done.
+    Retired,    // evicted and discarded, out of service
+  };
+
+  // Called once the device discard of @rid is done. Moves the region to
+  // Retired, or back to the clean pool if a resize() reactivated it in the
+  // meantime. Must be called with cleanRegionsMutex_ held exclusively.
+  void finishDiscardLocked(RegionId rid);
+
+  // Runs @func on a worker: the current one when called from a worker (so
+  // that worker's drain() covers it), otherwise the next in round robin.
+  void scheduleOnWorker(folly::Func func);
 
   bool deviceWrite(RelAddress addr, BufferView buf);
 
@@ -347,6 +433,15 @@ class RegionManager {
   std::vector<RegionId> cleanRegions_;
   const uint32_t numCleanRegions_{};
   mutable AtomicCounter cleanRegionRetries_;
+
+  // Per-region resize state, guarded by cleanRegionsMutex_.
+  std::vector<RegionState> regionState_;
+  // Regions [0, numActiveRegions_) are in service. Written under
+  // cleanRegionsMutex_, read lock-free by getSize()/getRandomRegion().
+  std::atomic<uint32_t> numActiveRegions_{0};
+  mutable AtomicCounter retiredCount_;
+  mutable AtomicCounter reactivatedCount_;
+  mutable AtomicCounter retireDiscardErrors_;
 
   std::atomic<uint64_t> seqNumber_{0};
 

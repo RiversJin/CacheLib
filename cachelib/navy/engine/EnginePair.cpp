@@ -305,6 +305,10 @@ uint64_t EnginePair::getUsableSize() const {
   return largeItemCache_->getSize() + smallItemCache_->getSize();
 }
 
+uint64_t EnginePair::resizeLargeItemCache(uint64_t newSize) {
+  return largeItemCache_->resize(newSize);
+}
+
 std::pair<Status, std::string> EnginePair::getRandomAlloc(Buffer& value) {
   uint64_t largeCacheSize = largeItemCache_->getSize();
   uint64_t smallCacheSize = smallItemCache_->getSize();

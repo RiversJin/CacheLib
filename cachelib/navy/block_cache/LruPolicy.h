@@ -52,6 +52,13 @@ class LruPolicy final : public EvictionPolicy {
   // Evicts the least recently used region and stops tracking.
   RegionId evict() override;
 
+  // Stops tracking @rid. O(1).
+  bool remove(RegionId rid) override;
+
+  // Stops tracking every region matching @pred. One walk of the list.
+  std::vector<RegionId> removeIf(
+      const std::function<bool(RegionId)>& pred) override;
+
   // Resets LRU policy to the initial state.
   void reset() override;
 
